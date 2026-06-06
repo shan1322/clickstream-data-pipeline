@@ -2,16 +2,21 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, col
 from pyspark.sql.types import StructType, StructField, StringType, LongType, IntegerType
 import os
-from dotenv import load_dotenv
+import sys
 
-load_dotenv()
+args = dict(a.split('=', 1) for a in sys.argv[1:] if '=' in a)
 
-KAFKA_BROKER = os.getenv('KAFKA_BROKER')
-KAFKA_TOPIC = os.getenv('KAFKA_TOPIC')
-S3_BUCKET = os.getenv('S3_BUCKET')
-AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
-AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
+KAFKA_BROKER = args.get('KAFKA_BROKER') or os.getenv('KAFKA_BROKER')
+KAFKA_TOPIC = args.get('KAFKA_TOPIC') or os.getenv('KAFKA_TOPIC')
+S3_BUCKET = args.get('S3_BUCKET') or os.getenv('S3_BUCKET')
+AWS_DEFAULT_REGION = args.get('AWS_DEFAULT_REGION') or os.getenv('AWS_DEFAULT_REGION')
+OPENSEARCH_HOST = args.get('OPENSEARCH_HOST') or os.getenv('OPENSEARCH_HOST')
+OPENSEARCH_PORT = args.get('OPENSEARCH_PORT') or os.getenv('OPENSEARCH_PORT')
+OPENSEARCH_USER = args.get('OPENSEARCH_USER') or os.getenv('OPENSEARCH_USER')
+OPENSEARCH_PASSWORD = args.get('OPENSEARCH_PASSWORD') or os.getenv('OPENSEARCH_PASSWORD')
+
+if not all([KAFKA_BROKER, KAFKA_TOPIC, S3_BUCKET, OPENSEARCH_HOST, OPENSEARCH_PORT]):
+    raise EnvironmentError("Missing required env vars")
 
 schema = StructType([
     StructField("user_id", IntegerType()),
@@ -24,15 +29,33 @@ schema = StructType([
 def create_spark_session():
     return SparkSession.builder \
         .appName("ClickstreamSparkStreaming") \
-        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,org.apache.hadoop:hadoop-aws:3.3.4,org.opensearch.client:opensearch-spark-30_2.12:1.1.0") \
-        .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY_ID) \
-        .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_ACCESS_KEY) \
+        .config("spark.hadoop.fs.s3a.bucket.clickstream-pipeline.endpoint.region", AWS_DEFAULT_REGION) \
         .config("spark.hadoop.fs.s3a.endpoint", f"s3.{AWS_DEFAULT_REGION}.amazonaws.com") \
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-        .config("opensearch.nodes", os.getenv("OPENSEARCH_HOST", "localhost")) \
-        .config("opensearch.port", os.getenv("OPENSEARCH_PORT", "9200")) \
+        .config("opensearch.nodes", OPENSEARCH_HOST) \
+        .config("opensearch.port", OPENSEARCH_PORT) \
         .config("opensearch.nodes.wan.only", "true") \
+        .config("opensearch.net.ssl", "true") \
+        .config("opensearch.net.ssl.cert.allow.self.signed", "true") \
+        .config("opensearch.net.http.auth.user", OPENSEARCH_USER) \
+        .config("opensearch.net.http.auth.pass", OPENSEARCH_PASSWORD) \
         .getOrCreate()
+
+def write_to_opensearch(batch_df, batch_id):
+    if batch_df.count() > 0:
+        batch_df.write \
+            .format("org.opensearch.spark.sql") \
+            .option("opensearch.resource", "clickstream") \
+            .option("opensearch.nodes", OPENSEARCH_HOST) \
+            .option("opensearch.port", OPENSEARCH_PORT) \
+            .option("opensearch.nodes.wan.only", "true") \
+            .option("opensearch.net.ssl", "true") \
+            .option("opensearch.net.ssl.cert.allow.self.signed", "true") \
+            .option("opensearch.security.ssl.certificate.verification", "false") \
+            .option("opensearch.net.http.auth.user", OPENSEARCH_USER) \
+            .option("opensearch.net.http.auth.pass", OPENSEARCH_PASSWORD) \
+            .mode("append") \
+            .save()
 
 def process_stream(spark):
     df = spark.readStream \
@@ -41,6 +64,9 @@ def process_stream(spark):
         .option("subscribe", KAFKA_TOPIC) \
         .option("startingOffsets", "latest") \
         .option("failOnDataLoss", "false") \
+        .option("kafka.security.protocol", "SSL") \
+        .option("kafka.ssl.truststore.type", "JKS") \
+        .option("kafka.ssl.endpoint.identification.algorithm", "") \
         .load()
 
     events = df.select(
@@ -48,7 +74,8 @@ def process_stream(spark):
     ).select("data.*")
 
     s3_path = S3_BUCKET.replace("s3://", "s3a://")
-    query = events.writeStream \
+
+    s3_query = events.writeStream \
         .format("parquet") \
         .option("path", s3_path) \
         .option("checkpointLocation", s3_path + "_checkpoint") \
@@ -56,11 +83,11 @@ def process_stream(spark):
         .trigger(processingTime="30 seconds") \
         .start()
 
-    def write_to_opensearch(batch_df, batch_id):
-        if batch_df.count() > 0:
-            batch_df.write.format("org.opensearch.spark.sql").option("opensearch.resource", "clickstream").option("opensearch.nodes", os.getenv("OPENSEARCH_HOST", "localhost")).option("opensearch.port", os.getenv("OPENSEARCH_PORT", "9200")).option("opensearch.nodes.wan.only", "true").mode("append").save()
-
-    os_query = events.writeStream.foreachBatch(write_to_opensearch).option("checkpointLocation", s3_path + "_os_checkpoint").trigger(processingTime="5 seconds").start()
+    os_query = events.writeStream \
+        .foreachBatch(write_to_opensearch) \
+        .option("checkpointLocation", s3_path + "_os_checkpoint") \
+        .trigger(processingTime="5 seconds") \
+        .start()
 
     spark.streams.awaitAnyTermination()
 

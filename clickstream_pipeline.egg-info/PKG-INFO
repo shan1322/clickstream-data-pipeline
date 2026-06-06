@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: clickstream-pipeline
+Version: 0.1.0
+Requires-Python: >=3.12
+Provides-Extra: api
+Requires-Dist: fastapi; extra == "api"
+Requires-Dist: uvicorn; extra == "api"
+Requires-Dist: gunicorn; extra == "api"
+Requires-Dist: kafka-python-ng; extra == "api"
+Requires-Dist: pydantic; extra == "api"
+Requires-Dist: python-dotenv; extra == "api"
+Provides-Extra: simulator
+Requires-Dist: locust; extra == "simulator"
+Requires-Dist: boto3; extra == "simulator"
+Requires-Dist: pandas; extra == "simulator"
+Requires-Dist: requests; extra == "simulator"
+Provides-Extra: etl
+Requires-Dist: pyspark==3.4.0; extra == "etl"
+Requires-Dist: boto3; extra == "etl"
+Requires-Dist: python-dotenv; extra == "etl"
+Requires-Dist: psycopg2-binary; extra == "etl"
+Provides-Extra: orchestration
+Requires-Dist: apache-airflow; extra == "orchestration"
+Requires-Dist: psycopg2-binary; extra == "orchestration"
+Requires-Dist: python-dotenv; extra == "orchestration"

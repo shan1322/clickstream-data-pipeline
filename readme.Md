@@ -2,7 +2,7 @@
 
 > Real-time clickstream ingestion, stream processing, and analytics on AWS — handling 10K–100K concurrent users with zero-downtime auto-scaling.
 
-![Pipeline Animation](animations/clickstream.gif)
+![Pipeline Animation](design/clickstream.gif)
 
 ---
 

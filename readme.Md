@@ -6,6 +6,12 @@
 
 ---
 
+## 📺 Demo Video
+
+[![Watch the demo](https://img.youtube.com/vi/nh1S8hemzo4/0.jpg)](http://youtube.com/watch?v=nh1S8hemzo4)
+
+---
+
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
@@ -159,6 +165,10 @@ AWS Glue would work but costs more per DPU-hour and has less flexibility. Step F
 - `clickstream-ecs-role` — ECS task role (S3, MSK, CloudWatch)
 - `clickstream-emr-role` — EMR Serverless execution role (S3, MSK, OpenSearch, Redshift)
 - `clickstream-redshift-role` — Redshift S3 access
+
+### AWS Cost Overview
+
+![AWS Costs](design/aws_costs.jpg)
 
 ---
 
@@ -353,6 +363,12 @@ Auto-scaling is configured on the ECS service using ALB `RequestCountPerTarget` 
 
 **Why RequestCountPerTarget?** When requests-per-task exceed 1,000, ALB signals ECS to add tasks. This directly measures actual load on the application.
 
+### Auto-Scaling in Action
+
+![Auto-scaling — tasks ramping up](design/autoscaling.jpg)
+
+![Auto-scaling — steady state at 10 tasks](design/autoscaling2.jpg)
+
 ### Auto-Scaling Policy
 
 ```bash
@@ -463,6 +479,10 @@ All pre-downloaded to `s3://clickstream-pipeline/jars/`:
 1. `run_spark_etl` — submits `etl/etl_job.py` to Spark (local mode)
 2. `verify_redshift` — checks row count in `clickstream_sessions`
 
+### Airflow DAG — Both Tasks SUCCESS
+
+![Airflow DAG](design/airflowdag.jpg)
+
 ### What the ETL Does
 
 `etl/etl_job.py` reads Parquet from S3, applies sessionization, and writes to Redshift:
@@ -487,15 +507,15 @@ engagement = (
 
 ```sql
 CREATE TABLE clickstream_sessions (
-    session_id        VARCHAR(36),
-    user_id           INTEGER,
-    session_start     TIMESTAMP,
-    session_end       TIMESTAMP,
-    duration_minutes  FLOAT,
-    page_views        INTEGER,
-    add_to_cart       INTEGER,
-    purchases         INTEGER,
-    engagement_score  FLOAT
+    session_id                VARCHAR(36),
+    user_id                   INTEGER,
+    session_start             TIMESTAMP,
+    session_end               TIMESTAMP,
+    session_duration_seconds  FLOAT,
+    view_count                INTEGER,
+    addtocart_count           INTEGER,
+    transaction_count         INTEGER,
+    total_events              INTEGER
 );
 ```
 
@@ -508,7 +528,6 @@ airflow dags trigger clickstream_etl
 ### Check Redshift Row Count
 
 ```bash
-# Via Redshift Query Editor in AWS Console, or:
 aws redshift-data execute-statement \
     --workgroup-name clickstream-workgroup \
     --database dev \
@@ -539,6 +558,10 @@ airflow dags backfill clickstream_etl \
 - **Name:** `clickstream`
 - **Documents:** 153,826+ (grows with every Locust run)
 - **Refresh:** Kibana dashboard set to auto-refresh every 5 seconds
+
+### Kibana Live Dashboard
+
+![Kibana Dashboard](design/kibana_dashboard.jpg)
 
 ### Check Document Count
 
@@ -575,19 +598,24 @@ SELECT COUNT(*) FROM clickstream_sessions;
 ### Sample Analytics Queries
 
 ```sql
--- Top 10 most engaged users
-SELECT user_id, AVG(engagement_score) as avg_score, SUM(purchases) as total_purchases
+-- Top 10 users by purchases
+SELECT user_id,
+       COUNT(*) as total_sessions,
+       AVG(session_duration_seconds) as avg_duration,
+       SUM(transaction_count) as total_purchases,
+       SUM(addtocart_count) as total_atc,
+       SUM(view_count) as total_views
 FROM clickstream_sessions
 GROUP BY user_id
-ORDER BY avg_score DESC
+ORDER BY total_purchases DESC
 LIMIT 10;
 
 -- Session duration distribution
 SELECT
     CASE
-        WHEN duration_minutes < 1  THEN '< 1 min'
-        WHEN duration_minutes < 5  THEN '1-5 min'
-        WHEN duration_minutes < 30 THEN '5-30 min'
+        WHEN session_duration_seconds < 60   THEN '< 1 min'
+        WHEN session_duration_seconds < 300  THEN '1-5 min'
+        WHEN session_duration_seconds < 1800 THEN '5-30 min'
         ELSE '> 30 min'
     END AS bucket,
     COUNT(*) as sessions
@@ -597,10 +625,10 @@ ORDER BY 2 DESC;
 
 -- Conversion funnel
 SELECT
-    SUM(page_views)  as total_views,
-    SUM(add_to_cart) as total_atc,
-    SUM(purchases)   as total_purchases,
-    ROUND(100.0 * SUM(purchases) / NULLIF(SUM(page_views), 0), 2) as conversion_rate
+    SUM(view_count)        as total_views,
+    SUM(addtocart_count)   as total_atc,
+    SUM(transaction_count) as total_purchases,
+    ROUND(100.0 * SUM(transaction_count) / NULLIF(SUM(view_count), 0), 2) as conversion_rate
 FROM clickstream_sessions;
 ```
 
@@ -608,7 +636,7 @@ FROM clickstream_sessions;
 
 ## Load Testing with Locust
 
-### Run 10,000 Users
+### Run 10,000 Users (headless)
 
 ```bash
 cd simulator
@@ -620,7 +648,16 @@ locust -f traffic_simulator.py \
     --headless
 ```
 
-### Run 100,000 Users (distributed — requires multiple workers)
+### Run with UI
+
+```bash
+cd simulator
+locust -f traffic_simulator.py \
+    --host=http://clickstream-alb-1631464060.us-east-1.elb.amazonaws.com
+# Open http://localhost:8089
+```
+
+### Run 100,000 Users (distributed)
 
 ```bash
 # Master
@@ -663,12 +700,19 @@ aws ecs update-service \
     --service clickstream-fastapi-service \
     --force-new-deployment \
     --region us-east-1
+
+# Watch tasks live
+watch -n 10 "aws ecs describe-services \
+    --cluster clickstream-cluster \
+    --services clickstream-fastapi-service \
+    --region us-east-1 \
+    --query 'services[0].{running:runningCount,desired:desiredCount}'"
 ```
 
 ### MSK
 
 ```bash
-# List topics
+# List clusters
 aws kafka list-clusters --region us-east-1
 
 # Get broker endpoints
@@ -723,28 +767,44 @@ curl -X DELETE -u "admin:<password>" \
     "https://search-clickstream-j3glehr2glclhpparfwtmi5mte.us-east-1.es.amazonaws.com/clickstream"
 ```
 
+### Shutdown All (save costs)
+
+```bash
+# Cancel EMR job
+JOB_ID=$(aws emr-serverless list-job-runs --application-id 00g687l6tffeq309 --region us-east-1 --query "jobRuns[?state=='RUNNING'].id" --output text)
+aws emr-serverless cancel-job-run --application-id 00g687l6tffeq309 --job-run-id $JOB_ID --region us-east-1
+
+# Stop EMR application
+aws emr-serverless stop-application --application-id 00g687l6tffeq309 --region us-east-1
+
+# Scale ECS to 0
+aws ecs update-service --cluster clickstream-cluster --service clickstream-fastapi-service --desired-count 0 --region us-east-1
+
+# Delete OpenSearch (can't pause)
+aws opensearch delete-domain --domain-name clickstream --region us-east-1
+
+# Delete MSK
+aws kafka delete-cluster --cluster-arn <CLUSTER_ARN> --region us-east-1
+
+# Delete Redshift
+aws redshift-serverless delete-workgroup --workgroup-name clickstream-workgroup --region ap-southeast-2
+aws redshift-serverless delete-namespace --namespace-name clickstream-namespace --region ap-southeast-2
+```
+
 ---
 
 ## Cost Considerations
 
-All resources are on AWS free tier or minimal paid tier for demo purposes:
+![AWS Cost Breakdown](design/aws_costs.jpg)
 
-- **ECS Fargate:** ~$0.04/vCPU-hour, $0.004/GB-hour. 2 tasks × 0.5 vCPU idle ≈ $1.50/day.
-- **MSK:** `kafka.t3.small` × 3 brokers ≈ $0.05/hour = ~$1.20/day.
-- **EMR Serverless:** Charged only when job is running. ~$0.052/vCPU-hour.
-- **OpenSearch:** `t3.small.search` × 1 node = ~$0.036/hour = ~$0.86/day.
+All resources are on minimal paid tier for demo purposes:
+
+- **ECS Fargate:** ~$0.04/vCPU-hour. 2 tasks idle ≈ $1.50/day.
+- **MSK:** `kafka.t3.small` × 3 brokers ≈ $1.20/day.
+- **EMR Serverless:** Charged only when job runs. ~$0.052/vCPU-hour.
+- **OpenSearch:** `t3.small.search` × 1 node ≈ $0.86/day.
 - **Redshift Serverless:** Charged per RPU-hour of queries. Minimal for demo.
 - **S3:** < $0.01/day for demo data volumes.
-
-**Stop all AWS resources when not in use to avoid charges.**
-
-```bash
-# Stop EMR job
-aws emr-serverless cancel-job-run --application-id 00g687l6tffeq309 --job-run-id <ID> --region us-east-1
-
-# Scale ECS to 0
-aws ecs update-service --cluster clickstream-cluster --service clickstream-fastapi-service --desired-count 0 --region us-east-1
-```
 
 ---
 
@@ -756,6 +816,7 @@ This project demonstrates end-to-end production data engineering:
 - **Stream processing** with Spark on managed EMR — two concurrent output streams
 - **Operational analytics** via OpenSearch + Kibana with 5-second refresh
 - **Batch ETL** via Airflow — sessionization, engagement scoring, Redshift load
-- **MLOps-adjacent** — drift detection, retraining, model versioning (see fraud-detection-mlops)
 
 **GitHub:** [shan1322/clickstream-data-pipeline](https://github.com/shan1322/clickstream-data-pipeline)
+
+**YouTube Demo:** [Watch → @shantanuds06](https://www.youtube.com/@shantanuds06)
